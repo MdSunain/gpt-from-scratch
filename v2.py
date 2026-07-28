@@ -1,1 +1,196 @@
-{"metadata":{"kernelspec":{"language":"python","display_name":"Python 3","name":"python3"},"language_info":{"name":"python","version":"3.12.13","mimetype":"text/x-python","codemirror_mode":{"name":"ipython","version":3},"pygments_lexer":"ipython3","nbconvert_exporter":"python","file_extension":".py"},"kaggle":{"accelerator":"nvidiaTeslaT4","dataSources":[{"sourceType":"datasetVersion","sourceId":18410506}],"isInternetEnabled":true,"language":"python","sourceType":"notebook","isGpuEnabled":false}},"nbformat_minor":4,"nbformat":4,"cells":[{"cell_type":"code","source":"import torch \nimport torch.nn as nn\nfrom torch.nn import functional as F\n\nbatch_size = 64 # 32\nblock_size = 256 # 8\nmax_iterations = 5000\neval_intervals = 500\nlearning_rate = 3e-4\ndevice = torch.device(\"cuda\" if torch.cuda.is_available() else \"cpu\")\neval_iterations = 200\nn_embd = 384\nn_head = 6\nn_layer = 6\ndropout = 0.2\n# ---------\ntorch.manual_seed(1337)\n\nkaggle_input = '/kaggle/input/datasets/mohammedsunain/input-txt/input.txt'\nwith open(kaggle_input, 'r', encoding='utf-8') as f:\n    data = f.read()\n\nchars = sorted(list(set(data)))\nvocab_size = len(chars)\n\ns_to_i = {ch:i for i,ch in enumerate(chars)} # encrypt mapping\ni_to_s = {i:ch for i,ch in enumerate(chars)} # decrypt mapping\n\ndef encode(s):\n    return [s_to_i[c] for c in s]\ndef decode(i):\n    return ''.join([i_to_s[c] for c in i])\n\nencrypted_data = torch.tensor(encode(data), dtype= torch.long)\n\nn = int(0.9*len(encrypted_data))\n\ntrain_data = encrypted_data[:n]\ntest_data = encrypted_data[n:]\n\n# data loading\ndef get_batch(split):\n    data = train_data if split == 'train' else test_data\n\n    ix = torch.randint(len(encrypted_data)-block_size, (batch_size,))\n    x = torch.stack([encrypted_data[i:i+block_size] for i in ix] )\n    y = torch.stack([encrypted_data[i+1:i+block_size+1] for i in ix])\n    x,y = x.to(device), y.to(device)\n    return x,y\n\ndef estimated_loss():\n    out = {}\n    model.eval()\n    for split in ['train', 'val']:\n        losses = torch.zeros(eval_iterations)\n        for k in range(eval_iterations):\n            X,Y = get_batch(split)\n            X, Y = X.to(device), Y.to(device)\n            logits, loss = model(X,Y)\n            losses[k] = loss.item()\n        out[split] = losses.mean()\n    model.train()\n    return out\n\nclass Head(nn.Module):\n    def __init__(self, head_size):\n        super().__init__()\n        self.key = nn.Linear(n_embd, head_size, bias=False)\n        self.query = nn.Linear(n_embd, head_size, bias=False)\n        self.value = nn.Linear(n_embd, head_size, bias=False)\n        self.register_buffer('tril',torch.tril(torch.ones(block_size,block_size)))\n        self.dropout = nn.Dropout(dropout)\n\n    def forward(self,x):\n        B,T,C = x.shape\n        k = self.key(x)\n        q = self.query(x)\n\n        weights = q @ k.transpose (-2,-1) * C**-0.5 # (B,T,16) @ (B,16,T) --> (B,T,T)\n\n# weights = torch.zeros((T,T))\n        weights = weights.masked_fill(self.tril[:T,:T]==0, float('-inf'))\n        weights = F.softmax(weights, dim= -1)\n        weights = self.dropout(weights)\n        v = self.value(x)\n        out = weights@ v\n        return out\n\nclass MultiHeadAttention(nn.Module):\n    \"\"\"multiple heads of self-attention in parallel\"\"\"\n\n    def __init__(self,num_heads, head_size):\n        super().__init__()\n        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])\n        self.proj = nn.Linear(n_embd, n_embd)\n        self.dropout = nn.Dropout(dropout)\n\n    def forward(self,x):\n        out = torch.cat([h(x) for h in self.heads], dim = -1)\n        out = self.dropout(self.proj(out))\n        return out\n\nclass FeedForward(nn.Module):\n    def __init__(self, n_embd):\n        super().__init__()\n        self.net = nn.Sequential(\n            nn.Linear(n_embd,n_embd * 4),\n            nn.ReLU(),\n            nn.Linear(4 * n_embd,n_embd),  \n            nn.Dropout(dropout),\n        )\n    def forward(self,x):\n        return self.net(x)\n\nclass Block(nn.Module):\n    \"\"\"Transformer block: communication followed by computation \"\"\"\n    def __init__(self, n_embd, n_head):    \n        super().__init__()\n        head_size = n_embd//n_head\n        self.sa = MultiHeadAttention(n_head, head_size)\n        self.ffwd = FeedForward(n_embd)\n        self.ln1 = nn.LayerNorm(n_embd)\n        self.ln2 = nn.LayerNorm(n_embd)\n\n    def forward(self,x):\n        x = x + self.sa(self.ln1(x))\n        x = x + self.ffwd(self.ln2(x))\n        return x\n\n\n# super simple bigram model\nclass bigramLanguageModel(nn.Module):\n    def __init__(self):\n        super().__init__()\n        self.token_embedding_table = nn.Embedding(vocab_size,n_embd)\n        self.position_embd_table = nn.Embedding(block_size, n_embd)\n        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])\n        self.ln_f = nn.LayerNorm(n_embd)\n        self.lm_head = nn.Linear(n_embd, vocab_size)\n\n    def forward(self, idx, targets = None):\n        B,T = idx.shape\n\n        tok_emb = self.token_embedding_table(idx) # B T C\n        pos_emb =  self.position_embd_table(torch.arange(T, device=idx.device))\n        x = tok_emb + pos_emb\n        x = self.blocks(x)\n        logits = self.lm_head(x) # B T vocab_size\n\n        \n        if targets is None:\n            loss = None\n        else:\n            B, T, C = logits.shape\n            logits = logits.view(B*T, C)\n            targets = targets.view(B*T)\n            loss = F.cross_entropy(logits, targets)\n        return logits, loss\n\n    def generate(self, idx, max_new_tokens):# idx is (B,T) array of indices\n        for _ in range(max_new_tokens):\n            idx_cond = idx[:, -block_size:]\n            # get the prediction\n            logits, loss = self(idx_cond)\n            # focus only on the last step\n            logits = logits[:,-1,:]# (B,C)\n            # apply softmax for probabilities\n            prob = F.softmax(logits, dim= -1)\n            # sample from the distribution\n            idx_next = torch.multinomial(prob, num_samples=1)\n            # append sampled index to the running sequence\n            idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)\n        return idx\n\n    \n\nmodel = bigramLanguageModel()\nmodel = model.to(device)\n# create a pytorch optimizer \noptimizer= torch.optim.Adam(model.parameters(), lr=1e-3)\n\nfor iters in range(max_iterations):\n    if iters % eval_intervals == 0:\n        losses = estimated_loss()\n        print(f\"step {iters}: train loss{losses['train']:.4f}, val loss {losses['val']:.4f}\")\n\n    xb, yb = get_batch('train')\n    xb, yb = xb.to(device), yb.to(device)\n\n    logits, loss = model(xb, yb)\n    optimizer.zero_grad(set_to_none=True)\n    loss.backward()\n    optimizer.step()\n\ncontext = torch.zeros((1,1) ,dtype=torch.long).to(device)\nprint(decode(model.generate(context, max_new_tokens=500)[0].tolist()))","metadata":{"_uuid":"b1115754-1cfa-4d9f-9634-25c46078650d","_cell_guid":"4e265895-9cb5-4e3e-b304-f75a6d2ae7db","trusted":true,"collapsed":false,"jupyter":{"outputs_hidden":false},"execution":{"iopub.status.busy":"2026-07-28T15:18:24.957533Z","iopub.execute_input":"2026-07-28T15:18:24.958293Z","iopub.status.idle":"2026-07-28T16:13:15.734258Z","shell.execute_reply.started":"2026-07-28T15:18:24.958263Z","shell.execute_reply":"2026-07-28T16:13:15.733483Z"}},"outputs":[{"name":"stdout","text":"step 0: train loss4.4743, val loss 4.4748\nstep 500: train loss1.7572, val loss 1.7601\nstep 1000: train loss1.4470, val loss 1.4481\nstep 1500: train loss1.3197, val loss 1.3172\nstep 2000: train loss1.2442, val loss 1.2459\nstep 2500: train loss1.1919, val loss 1.1892\nstep 3000: train loss1.1321, val loss 1.1333\nstep 3500: train loss1.0878, val loss 1.0878\nstep 4000: train loss1.0407, val loss 1.0409\nstep 4500: train loss0.9902, val loss 0.9895\n\nBIONDELLO:\nSicilia with such spick too,\nI do promise as she is of that write.\n\nBIONDELLO:\nHe should because Rome in, no more:\nI think me\nCome one upon y you a grave tender or hadstard\nHis grows are heirs; like men will rise: come to-day,\nTo--\n\nANTONIO:\nGrave me, good get gone, I say! what not you to prithee\nI cleft to-meet again.\n\nLORD FITZWATER:\nI did call thy wrongs are all tongue.\n\nROMEO:\nMy Lord Northumberland's slaves in France,\nMy dread Bolingbroke.\n\nNORTHUMBERLAND:\nMy lord, my master, and\n","output_type":"stream"}],"execution_count":16}]}
+import torch 
+import torch.nn as nn
+from torch.nn import functional as F
+
+batch_size = 64 # 32
+block_size = 256 # 8
+max_iterations = 5000
+eval_intervals = 500
+learning_rate = 3e-4
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+eval_iterations = 200
+n_embd = 384
+n_head = 6
+n_layer = 6
+dropout = 0.2
+# ---------
+torch.manual_seed(1337)
+
+kaggle_input = '/kaggle/input/datasets/mohammedsunain/input-txt/input.txt'
+with open(kaggle_input, 'r', encoding='utf-8') as f:
+    data = f.read()
+
+chars = sorted(list(set(data)))
+vocab_size = len(chars)
+
+s_to_i = {ch:i for i,ch in enumerate(chars)} # encrypt mapping
+i_to_s = {i:ch for i,ch in enumerate(chars)} # decrypt mapping
+
+def encode(s):
+    return [s_to_i[c] for c in s]
+def decode(i):
+    return ''.join([i_to_s[c] for c in i])
+
+encrypted_data = torch.tensor(encode(data), dtype= torch.long)
+
+n = int(0.9*len(encrypted_data))
+
+train_data = encrypted_data[:n]
+test_data = encrypted_data[n:]
+
+# data loading
+def get_batch(split):
+    data = train_data if split == 'train' else test_data
+
+    ix = torch.randint(len(encrypted_data)-block_size, (batch_size,))
+    x = torch.stack([encrypted_data[i:i+block_size] for i in ix] )
+    y = torch.stack([encrypted_data[i+1:i+block_size+1] for i in ix])
+    x,y = x.to(device), y.to(device)
+    return x,y
+
+def estimated_loss():
+    out = {}
+    model.eval()
+    for split in ['train', 'val']:
+        losses = torch.zeros(eval_iterations)
+        for k in range(eval_iterations):
+            X,Y = get_batch(split)
+            X, Y = X.to(device), Y.to(device)
+            logits, loss = model(X,Y)
+            losses[k] = loss.item()
+        out[split] = losses.mean()
+    model.train()
+    return out
+
+class Head(nn.Module):
+    def __init__(self, head_size):
+        super().__init__()
+        self.key = nn.Linear(n_embd, head_size, bias=False)
+        self.query = nn.Linear(n_embd, head_size, bias=False)
+        self.value = nn.Linear(n_embd, head_size, bias=False)
+        self.register_buffer('tril',torch.tril(torch.ones(block_size,block_size)))
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self,x):
+        B,T,C = x.shape
+        k = self.key(x)
+        q = self.query(x)
+
+        weights = q @ k.transpose (-2,-1) * C**-0.5 # (B,T,16) @ (B,16,T) --> (B,T,T)
+
+# weights = torch.zeros((T,T))
+        weights = weights.masked_fill(self.tril[:T,:T]==0, float('-inf'))
+        weights = F.softmax(weights, dim= -1)
+        weights = self.dropout(weights)
+        v = self.value(x)
+        out = weights@ v
+        return out
+
+class MultiHeadAttention(nn.Module):
+    """multiple heads of self-attention in parallel"""
+
+    def __init__(self,num_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(n_embd, n_embd)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self,x):
+        out = torch.cat([h(x) for h in self.heads], dim = -1)
+        out = self.dropout(self.proj(out))
+        return out
+
+class FeedForward(nn.Module):
+    def __init__(self, n_embd):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd,n_embd * 4),
+            nn.ReLU(),
+            nn.Linear(4 * n_embd,n_embd),  
+            nn.Dropout(dropout),
+        )
+    def forward(self,x):
+        return self.net(x)
+
+class Block(nn.Module):
+    """Transformer block: communication followed by computation """
+    def __init__(self, n_embd, n_head):    
+        super().__init__()
+        head_size = n_embd//n_head
+        self.sa = MultiHeadAttention(n_head, head_size)
+        self.ffwd = FeedForward(n_embd)
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
+
+    def forward(self,x):
+        x = x + self.sa(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
+        return x
+
+
+# super simple bigram model
+class bigramLanguageModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.token_embedding_table = nn.Embedding(vocab_size,n_embd)
+        self.position_embd_table = nn.Embedding(block_size, n_embd)
+        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embd)
+        self.lm_head = nn.Linear(n_embd, vocab_size)
+
+    def forward(self, idx, targets = None):
+        B,T = idx.shape
+
+        tok_emb = self.token_embedding_table(idx) # B T C
+        pos_emb =  self.position_embd_table(torch.arange(T, device=idx.device))
+        x = tok_emb + pos_emb
+        x = self.blocks(x)
+        logits = self.lm_head(x) # B T vocab_size
+
+        
+        if targets is None:
+            loss = None
+        else:
+            B, T, C = logits.shape
+            logits = logits.view(B*T, C)
+            targets = targets.view(B*T)
+            loss = F.cross_entropy(logits, targets)
+        return logits, loss
+
+    def generate(self, idx, max_new_tokens):# idx is (B,T) array of indices
+        for _ in range(max_new_tokens):
+            idx_cond = idx[:, -block_size:]
+            # get the prediction
+            logits, loss = self(idx_cond)
+            # focus only on the last step
+            logits = logits[:,-1,:]# (B,C)
+            # apply softmax for probabilities
+            prob = F.softmax(logits, dim= -1)
+            # sample from the distribution
+            idx_next = torch.multinomial(prob, num_samples=1)
+            # append sampled index to the running sequence
+            idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
+        return idx
+
+    
+
+model = bigramLanguageModel()
+model = model.to(device)
+# create a pytorch optimizer 
+optimizer= torch.optim.Adam(model.parameters(), lr=1e-3)
+
+for iters in range(max_iterations):
+    if iters % eval_intervals == 0:
+        losses = estimated_loss()
+        print(f"step {iters}: train loss{losses['train']:.4f}, val loss {losses['val']:.4f}")
+
+    xb, yb = get_batch('train')
+    xb, yb = xb.to(device), yb.to(device)
+
+    logits, loss = model(xb, yb)
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    optimizer.step()
+
+context = torch.zeros((1,1) ,dtype=torch.long).to(device)
+print(decode(model.generate(context, max_new_tokens=500)[0].tolist()))
